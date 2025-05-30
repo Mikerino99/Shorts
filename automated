@@ -1,1 +1,146 @@
+import os
+import random
+import openai
+import requests
+import json
+import datetime
+import subprocess
+from moviepy.editor import (VideoFileClip, AudioFileClip, TextClip, CompositeVideoClip,
+                            concatenate_videoclips)
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+
+# Load environment variables or set manually
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+openai.api_key = OPENAI_API_KEY
+
+# Constants
+QUOTE_MODEL = "gpt-3.5-turbo"
+MOODS = ["calm", "motivational", "inspirational", "sad", "happy"]
+VIDEO_RES = (1080, 1920)
+
+# 1. Generate Quote via GPT-3.5
+def generate_quote():
+    today = datetime.date.today().strftime("%B %d, %Y")
+    prompt = f"Give me a motivational quote for {today}."
+    response = openai.ChatCompletion.create(
+        model=QUOTE_MODEL,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return response.choices[0].message['content'].strip()
+
+# 2. Text-to-Speech with ElevenLabs
+def text_to_speech(text, output_path="voice.mp3"):
+    url = "https://api.elevenlabs.io/v1/text-to-speech/21m00Tcm4TlvDq8ikWAM"  # default voice
+    headers = {
+        "xi-api-key": ELEVENLABS_API_KEY,
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "text": text,
+        "voice_settings": {
+            "stability": 0.75,
+            "similarity_boost": 0.75
+        }
+    }
+    response = requests.post(url, headers=headers, json=payload)
+    with open(output_path, "wb") as f:
+        f.write(response.content)
+    return output_path
+
+# 3. Select matching GIF and music by mood
+def choose_media(mood):
+    gif_dir = f"media/gifs/{mood}"
+    music_dir = f"media/music/{mood}"
+    gif = os.path.join(gif_dir, random.choice(os.listdir(gif_dir)))
+    music = os.path.join(music_dir, random.choice(os.listdir(music_dir)))
+    return gif, music
+
+# 4. Create short video
+def create_video(text, gif_path, music_path, voice_path, output="short.mp4"):
+    gif_clip = VideoFileClip(gif_path).resize(height=VIDEO_RES[1], width=VIDEO_RES[0])
+    audio_clip = AudioFileClip(music_path).volumex(0.3)
+    voice_clip = AudioFileClip(voice_path)
+    final_audio = voice_clip.set_start(0).audio_fadeout(1).set_duration(voice_clip.duration).volumex(1.0)
+
+    text_clips = []
+    lines = text.split('. ')
+    duration_per_line = voice_clip.duration / len(lines)
+
+    for i, line in enumerate(lines):
+        txt_clip = TextClip(line.strip(), fontsize=60, color='white', size=VIDEO_RES, method='caption') \
+                    .set_position('center').set_duration(duration_per_line).set_start(i * duration_per_line)
+        text_clips.append(txt_clip)
+
+    video = CompositeVideoClip([gif_clip] + text_clips).set_audio(final_audio)
+    video = video.set_duration(voice_clip.duration)
+    video.write_videofile(output, fps=24, codec='libx264', audio_codec='aac')
+    return output
+
+# 5. Upload to YouTube
+def upload_to_youtube(video_path, title, description, tags):
+    SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+    creds = None
+    if os.path.exists("token.json"):
+        creds = Credentials.from_authorized_user_file("token.json", SCOPES)
+    else:
+        flow = InstalledAppFlow.from_client_secrets_file("client_secrets.json", SCOPES)
+        creds = flow.run_local_server(port=0)
+        with open("token.json", "w") as token:
+            token.write(creds.to_json())
+
+    youtube = build("youtube", "v3", credentials=creds)
+
+    request_body = {
+        'snippet': {
+            'title': title,
+            'description': description,
+            'tags': tags,
+            'categoryId': '22'  # People & Blogs
+        },
+        'status': {
+            'privacyStatus': 'public',
+            'selfDeclaredMadeForKids': False,
+        }
+    }
+
+    request = youtube.videos().insert(
+        part=','.join(request_body.keys()),
+        body=request_body,
+        media_body=video_path
+    )
+    response = request.execute()
+    return response
+
+# 6. Generate metadata using GPT
+
+def generate_metadata(quote):
+    prompt = f"Create a high-SEO YouTube short title, description, and 10 relevant tags for the quote: '{quote}'"
+    response = openai.ChatCompletion.create(
+        model=QUOTE_MODEL,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    content = response.choices[0].message['content']
+    # This assumes content is structured well. You might parse with regex or formats for production use.
+    return content
+
+# Main Automation
+if __name__ == "__main__":
+    quote = generate_quote()
+    voice_path = text_to_speech(quote)
+    mood = random.choice(MOODS)
+    gif, music = choose_media(mood)
+    video_path = create_video(quote, gif, music, voice_path)
+    metadata = generate_metadata(quote)
+
+    # Basic parsing (for demo purposes)
+    lines = metadata.splitlines()
+    title = lines[0].replace("Title:", "").strip()
+    description = lines[1].replace("Description:", "").strip()
+    tags = [tag.strip() for tag in lines[2].replace("Tags:", "").split(',')]
+
+    upload_response = upload_to_youtube(video_path, title, description, tags)
+    print("Video uploaded:", upload_response.get("id"))
 
